@@ -64,6 +64,46 @@ def make_session() -> requests.Session:
     return s
 
 
+def _verify_session(session: requests.Session) -> None:
+    log.info("Vérification de la session…")
+    r = session.get(INDEX_URL, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"L'index renvoie HTTP {r.status_code}.")
+    body = r.text.lower()
+    if any(k in body for k in ("déconnexion", "logout", "mon compte")):
+        log.info("Session authentifiée détectée.")
+    else:
+        log.warning(
+            "La page d'index est lisible mais aucune mention de "
+            "déconnexion/compte — vous êtes peut-être déconnecté."
+        )
+
+
+def load_cookies_file(session: requests.Session, path: str) -> None:
+    """Charge un fichier cookies.txt au format Netscape."""
+    from http.cookiejar import MozillaCookieJar
+
+    log.info("Lecture des cookies depuis %s", path)
+    jar = MozillaCookieJar()
+    try:
+        jar.load(path, ignore_discard=True, ignore_expires=True)
+    except Exception as e:
+        raise RuntimeError(f"Impossible de lire {path} : {e}") from e
+
+    n = 0
+    for c in jar:
+        if "jle.com" in (c.domain or ""):
+            session.cookies.set_cookie(c)
+            n += 1
+    log.info("  %d cookies jle.com chargés.", n)
+    if n == 0:
+        raise RuntimeError(
+            f"Aucun cookie pour jle.com dans {path}. "
+            "Assurez-vous d'être connecté à jle.com avant l'export."
+        )
+    _verify_session(session)
+
+
 def load_browser_cookies(session: requests.Session, browser: str) -> None:
     """Charge les cookies jle.com depuis un navigateur installé localement.
 
@@ -109,23 +149,7 @@ def load_browser_cookies(session: requests.Session, browser: str) -> None:
             "Aucun cookie jle.com trouvé. Connectez-vous à jle.com dans "
             f"{browser}, puis relancez le script."
         )
-
-    # Vérification : la page d'index doit être accessible
-    log.info("Vérification de la session…")
-    r = session.get(INDEX_URL, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(
-            f"L'index renvoie HTTP {r.status_code}. La session n'est "
-            "peut-être pas authentifiée."
-        )
-    if "déconnexion" in r.text.lower() or "logout" in r.text.lower() or "mon compte" in r.text.lower():
-        log.info("Session authentifiée détectée.")
-    else:
-        log.warning(
-            "La page d'index est lisible mais aucune mention de "
-            "déconnexion/compte n'est trouvée — vous êtes peut-être "
-            "déconnecté. Vérifiez dans le navigateur."
-        )
+    _verify_session(session)
 
 
 def get_soup(session: requests.Session, url: str, delay: float) -> BeautifulSoup:
@@ -304,9 +328,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument(
         "--browser",
-        default="chrome",
+        default=None,
         help="Navigateur dans lequel récupérer les cookies de session "
-             "(chrome, firefox, edge, brave, opera, chromium, vivaldi). Défaut: chrome.",
+             "(chrome, firefox, edge, brave, opera, chromium, vivaldi). "
+             "Note : Chrome/Edge sous Windows refusent souvent la lecture "
+             "depuis Chrome 127+ ; utilisez --cookies dans ce cas.",
+    )
+    p.add_argument(
+        "--cookies",
+        default=None,
+        help="Chemin vers un fichier cookies.txt au format Netscape "
+             "(exporté depuis le navigateur via une extension comme "
+             "'Get cookies.txt LOCALLY').",
     )
     return p.parse_args()
 
@@ -323,7 +356,13 @@ def main() -> int:
 
     session = make_session()
     try:
-        load_browser_cookies(session, args.browser)
+        if args.cookies:
+            load_cookies_file(session, args.cookies)
+        elif args.browser:
+            load_browser_cookies(session, args.browser)
+        else:
+            log.error("Indiquez --cookies <fichier> ou --browser <nom>.")
+            return 2
     except Exception as e:
         log.error("Échec d'authentification : %s", e)
         return 3
