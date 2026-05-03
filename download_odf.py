@@ -79,6 +79,26 @@ def _verify_session(session: requests.Session) -> None:
         )
 
 
+def load_cookie_header(session: requests.Session, path: str) -> None:
+    """Charge un en-tête Cookie brut (format 'name=value; name=value')."""
+    log.info("Lecture de l'en-tête Cookie depuis %s", path)
+    raw = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    n = 0
+    for piece in raw.split(";"):
+        piece = piece.strip()
+        if not piece or "=" not in piece:
+            continue
+        name, value = piece.split("=", 1)
+        session.cookies.set(name.strip(), value.strip(), domain=".jle.com")
+        n += 1
+    log.info("  %d cookies chargés.", n)
+    if n == 0:
+        raise RuntimeError(f"Aucun cookie lisible dans {path}.")
+    _verify_session(session)
+
+
 def load_cookies_file(session: requests.Session, path: str) -> None:
     """Charge un fichier cookies.txt au format Netscape."""
     from http.cookiejar import MozillaCookieJar
@@ -341,6 +361,13 @@ def parse_args() -> argparse.Namespace:
              "(exporté depuis le navigateur via une extension comme "
              "'Get cookies.txt LOCALLY').",
     )
+    p.add_argument(
+        "--cookie-header",
+        default=None,
+        help="Chemin vers un fichier contenant l'en-tête Cookie brut "
+             "(format 'name1=value1; name2=value2'), copié depuis les "
+             "DevTools du navigateur.",
+    )
     return p.parse_args()
 
 
@@ -356,12 +383,16 @@ def main() -> int:
 
     session = make_session()
     try:
-        if args.cookies:
+        if args.cookie_header:
+            load_cookie_header(session, args.cookie_header)
+        elif args.cookies:
             load_cookies_file(session, args.cookies)
         elif args.browser:
             load_browser_cookies(session, args.browser)
         else:
-            log.error("Indiquez --cookies <fichier> ou --browser <nom>.")
+            log.error(
+                "Indiquez --cookie-header <fichier>, --cookies <fichier> ou --browser <nom>."
+            )
             return 2
     except Exception as e:
         log.error("Échec d'authentification : %s", e)

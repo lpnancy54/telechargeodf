@@ -6,3 +6,4 @@ __pycache__/
 .venv/
 cookies.txt
 cookies*.txt
+cookie_header.txt
