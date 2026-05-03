@@ -230,19 +230,19 @@ def list_issues(session: requests.Session, delay: float) -> list[Issue]:
             full = urljoin(INDEX_URL, href)
             if urlparse(full).netloc and "jle.com" not in urlparse(full).netloc:
                 continue
-            # heuristique : un sommaire a souvent "sommaire" ou "numero" dans l'URL
-            if not re.search(r"(sommaire|numero|issue)", full, re.IGNORECASE):
+            # heuristique : un sommaire est typiquement /fr/revues/odf/sommaire.phtml?cle_parution=NNNN
+            if "sommaire" not in full.lower():
                 continue
             if full in seen:
                 continue
             text = el.get_text(" ", strip=True)
             year = current_year or (YEAR_RE.search(text).group(0) if YEAR_RE.search(text) else "")
-            num_match = NUM_RE.search(text)
-            numero = num_match.group(1) if num_match else ""
+            # numéro = cle_parution dans l'URL
+            cle = re.search(r"cle_parution=(\d+)", full)
+            numero = cle.group(1) if cle else ""
             if not numero:
-                # fallback : dernier segment "numérique" de l'URL
-                tail = re.findall(r"\d+", full)
-                numero = tail[-1] if tail else "inconnu"
+                num_match = NUM_RE.search(text)
+                numero = num_match.group(1) if num_match else "inconnu"
             seen.add(full)
             issues.append(Issue(year=year or "inconnu", numero=numero, url=full))
 
@@ -258,29 +258,93 @@ DATE_RE = re.compile(
 )
 
 
+ARTICLE_HINT = re.compile(r"(e-docs|article|cle_doc)", re.IGNORECASE)
+SKIP_HINT = re.compile(
+    r"(sommaire|numero|abonn|panier|login|logout|deconnex|déconnex|/aide|/contact|/cgu|/mentions)",
+    re.IGNORECASE,
+)
+
+
+def list_articles(session: requests.Session, sommaire_url: str, delay: float) -> list[str]:
+    """Liste les URLs d'articles depuis une page sommaire."""
+    soup = get_soup(session, sommaire_url, delay)
+    seen: set[str] = set()
+    out: list[str] = []
+    for a in soup.find_all("a", href=True):
+        full = urljoin(sommaire_url, a["href"]).split("#", 1)[0]
+        if not full or "jle.com" not in urlparse(full).netloc:
+            continue
+        if full == sommaire_url:
+            continue
+        if SKIP_HINT.search(full):
+            continue
+        if not ARTICLE_HINT.search(full):
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        out.append(full)
+    return out
+
+
+def extract_pdfs_from_article(
+    session: requests.Session, article_url: str, delay: float
+) -> tuple[str, str, list[str]]:
+    """Renvoie (titre, date, liste d'URLs PDF) pour un article."""
+    soup = get_soup(session, article_url, delay)
+    title_el = soup.find(["h1", "h2"])
+    title = title_el.get_text(" ", strip=True) if title_el else ""
+    page_text = soup.get_text(" ", strip=True)
+    m = DATE_RE.search(page_text)
+    date_str = "-".join(m.groups()) if m else ""
+
+    pdfs: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        full = urljoin(article_url, href)
+        if "jle.com" not in urlparse(full).netloc:
+            continue
+        # cas 1 : lien direct .pdf
+        if ".pdf" in full.lower():
+            pdfs.append(full)
+            continue
+        # cas 2 : lien dont le texte contient "PDF"
+        text = a.get_text(" ", strip=True).lower()
+        if "pdf" in text and "telecharg" in text or text == "pdf":
+            pdfs.append(full)
+    # dédup en gardant l'ordre
+    seen: set[str] = set()
+    uniq = [p for p in pdfs if not (p in seen or seen.add(p))]
+    return title, date_str, uniq
+
+
 def extract_pdfs(
     session: requests.Session, issue: Issue, delay: float
 ) -> list[PdfLink]:
-    soup = get_soup(session, issue.url, delay)
+    """Pour chaque article du sommaire, récupère les PDFs."""
+    articles = list_articles(session, issue.url, delay)
+    log.info("  %d articles dans le sommaire", len(articles))
     pdfs: list[PdfLink] = []
     seq = 0
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if ".pdf" not in href.lower():
+    for art in articles:
+        try:
+            title, date_str, urls = extract_pdfs_from_article(session, art, delay)
+        except Exception as e:
+            log.warning("  article %s : %s", art, e)
             continue
-        full = urljoin(issue.url, href)
-        if urlparse(full).netloc and "jle.com" not in urlparse(full).netloc:
+        if not urls:
+            log.debug("    aucun PDF dans %s", art)
             continue
-        title = a.get_text(" ", strip=True) or Path(urlparse(full).path).name
-        # date : on regarde le contexte de l'élément parent
-        ctx = a.find_parent(["article", "li", "div", "tr", "p"])
-        date_str = ""
-        if ctx:
-            m = DATE_RE.search(ctx.get_text(" ", strip=True))
-            if m:
-                date_str = "-".join(m.groups())
-        seq += 1
-        pdfs.append(PdfLink(url=full, title=title, date=date_str or "sans-date", seq=seq))
+        for url in urls:
+            seq += 1
+            pdfs.append(
+                PdfLink(
+                    url=url,
+                    title=title or Path(urlparse(art).path).stem,
+                    date=date_str or "sans-date",
+                    seq=seq,
+                )
+            )
     return pdfs
 
 
@@ -344,6 +408,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="downloads", help="Dossier de sortie (défaut: downloads)")
     p.add_argument("--delay", type=float, default=1.0, help="Délai entre requêtes en secondes")
     p.add_argument("--year", help="Filtre : ne traite que cette année")
+    p.add_argument("--limit", type=int, default=0, help="N'examiner que les N premiers numéros (0 = tous)")
     p.add_argument("--dry-run", action="store_true", help="Liste sans télécharger")
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument(
@@ -402,6 +467,9 @@ def main() -> int:
     if args.year:
         issues = [i for i in issues if i.year == args.year]
         log.info("Filtré sur %s : %d numéros", args.year, len(issues))
+    if args.limit:
+        issues = issues[: args.limit]
+        log.info("Limité à %d numéros", len(issues))
 
     total_dl = 0
     for issue in issues:
