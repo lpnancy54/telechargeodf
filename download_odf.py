@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Télécharge les PDFs de la revue ODF (jle.com) triés par année / numéro / date.
 
-Usage rapide :
+Mode recommandé : connectez-vous à jle.com dans Chrome, fermez Chrome,
+puis lancez :
 
-    pip install requests beautifulsoup4 lxml
-    export JLE_USER='votre_login'
-    export JLE_PASS='votre_motdepasse'
-    python download_odf.py
+    pip install -r requirements.txt
+    python download_odf.py --browser chrome
+
+Le script reprend automatiquement les cookies de votre navigateur, donc
+plus besoin d'identifiants en variable d'environnement.
+
+Navigateurs supportés : chrome, firefox, edge, brave, opera, chromium, vivaldi.
 
 Options utiles :
 
@@ -15,9 +19,6 @@ Options utiles :
     --year 2023              ne traite qu'une année
     --dry-run                liste sans télécharger
     --verbose                logs détaillés
-
-Si jle.com modifie son formulaire de connexion, ajustez LOGIN_URL et le
-dictionnaire de payload dans `login()`.
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ from bs4 import BeautifulSoup
 
 BASE = "https://www.jle.com"
 INDEX_URL = f"{BASE}/fr/revues/odf/numero.phtml"
-LOGIN_URL = f"{BASE}/fr/login"  # à ajuster si besoin
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -64,48 +64,68 @@ def make_session() -> requests.Session:
     return s
 
 
-def login(session: requests.Session, user: str, password: str) -> None:
-    """Authentifie la session. Adaptez les noms de champs si jle.com change."""
-    log.info("Récupération du formulaire de connexion…")
-    r = session.get(LOGIN_URL, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
+def load_browser_cookies(session: requests.Session, browser: str) -> None:
+    """Charge les cookies jle.com depuis un navigateur installé localement.
 
-    form = soup.find("form")
-    if form is None:
+    Utilise browser_cookie3. Sous Windows, Chrome chiffre ses cookies avec
+    DPAPI : il faut généralement fermer Chrome pour que la lecture passe.
+    """
+    try:
+        import browser_cookie3 as bc3
+    except ImportError as e:
         raise RuntimeError(
-            f"Aucun formulaire trouvé sur {LOGIN_URL}. "
-            "Inspectez la page et ajustez LOGIN_URL / login() en conséquence."
+            "Le module 'browser_cookie3' n'est pas installé. "
+            "Lancez :  pip install -r requirements.txt"
+        ) from e
+
+    loaders = {
+        "chrome": bc3.chrome,
+        "firefox": bc3.firefox,
+        "edge": bc3.edge,
+        "brave": bc3.brave,
+        "opera": bc3.opera,
+        "chromium": bc3.chromium,
+        "vivaldi": bc3.vivaldi,
+    }
+    if browser not in loaders:
+        raise RuntimeError(f"Navigateur non supporté : {browser}")
+
+    log.info("Lecture des cookies %s pour jle.com…", browser)
+    try:
+        jar = loaders[browser](domain_name="jle.com")
+    except Exception as e:
+        raise RuntimeError(
+            f"Impossible de lire les cookies de {browser} : {e}\n"
+            "Astuce Windows : fermez complètement Chrome avant de relancer."
+        ) from e
+
+    n = 0
+    for c in jar:
+        session.cookies.set_cookie(c)
+        n += 1
+    log.info("  %d cookies chargés.", n)
+    if n == 0:
+        raise RuntimeError(
+            "Aucun cookie jle.com trouvé. Connectez-vous à jle.com dans "
+            f"{browser}, puis relancez le script."
         )
 
-    action = urljoin(LOGIN_URL, form.get("action") or LOGIN_URL)
-    payload: dict[str, str] = {}
-    for inp in form.find_all("input"):
-        name = inp.get("name")
-        if not name:
-            continue
-        payload[name] = inp.get("value", "")
-
-    # heuristique : champs habituels
-    for k in list(payload):
-        kl = k.lower()
-        if any(t in kl for t in ("login", "user", "email", "mail")):
-            payload[k] = user
-        elif "pass" in kl or "pwd" in kl or "mdp" in kl:
-            payload[k] = password
-
-    log.info("Envoi des identifiants…")
-    r = session.post(action, data=payload, timeout=30, allow_redirects=True)
-    r.raise_for_status()
-
-    # Vérification simple
-    if "logout" not in r.text.lower() and "déconnexion" not in r.text.lower():
-        log.warning(
-            "Connexion incertaine : la page ne mentionne pas de déconnexion. "
-            "Le script va continuer mais certains PDFs peuvent être inaccessibles."
+    # Vérification : la page d'index doit être accessible
+    log.info("Vérification de la session…")
+    r = session.get(INDEX_URL, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"L'index renvoie HTTP {r.status_code}. La session n'est "
+            "peut-être pas authentifiée."
         )
+    if "déconnexion" in r.text.lower() or "logout" in r.text.lower() or "mon compte" in r.text.lower():
+        log.info("Session authentifiée détectée.")
     else:
-        log.info("Authentification réussie.")
+        log.warning(
+            "La page d'index est lisible mais aucune mention de "
+            "déconnexion/compte n'est trouvée — vous êtes peut-être "
+            "déconnecté. Vérifiez dans le navigateur."
+        )
 
 
 def get_soup(session: requests.Session, url: str, delay: float) -> BeautifulSoup:
@@ -282,6 +302,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--year", help="Filtre : ne traite que cette année")
     p.add_argument("--dry-run", action="store_true", help="Liste sans télécharger")
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument(
+        "--browser",
+        default="chrome",
+        help="Navigateur dans lequel récupérer les cookies de session "
+             "(chrome, firefox, edge, brave, opera, chromium, vivaldi). Défaut: chrome.",
+    )
     return p.parse_args()
 
 
@@ -292,18 +318,12 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    user = os.environ.get("JLE_USER")
-    password = os.environ.get("JLE_PASS")
-    if not user or not password:
-        log.error("Définissez JLE_USER et JLE_PASS dans l'environnement.")
-        return 2
-
     out_root = Path(args.out).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
     session = make_session()
     try:
-        login(session, user, password)
+        load_browser_cookies(session, args.browser)
     except Exception as e:
         log.error("Échec d'authentification : %s", e)
         return 3
